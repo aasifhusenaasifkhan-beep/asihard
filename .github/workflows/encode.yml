@@ -1,0 +1,89 @@
+name: Encode & Subtitle Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_type:
+        description: 'Task Type'
+        required: true
+      video_id:
+        description: 'Telegram Video Link'
+        required: true
+      sub_id:
+        description: 'Subtitle Link'
+        required: false
+        default: 'none'
+      wm_id:
+        description: 'Watermark Link'
+        required: false
+        default: 'none'
+      wm_pos:
+        description: 'Watermark Position'
+        required: false
+        default: 'none'
+      rename:
+        description: 'Output File Name'
+        required: false
+        default: 'output.mp4'
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      user_id:
+        description: 'User ID'
+        required: false
+        default: 'none'
+      resolution:
+        description: 'Resolution'
+        required: false
+        default: 'none'
+      font_link:
+        description: 'Font Link'
+        required: false
+        default: 'none'
+      trigger_msg_id:
+        description: 'Trigger Message ID'
+        required: false
+        default: 'none'
+
+jobs:
+  encode_job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies (FFmpeg & Fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-liberation
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Fast Video Encoder
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TASK_TYPE: ${{ github.event.inputs.task_type }}
+          VIDEO_ID: ${{ github.event.inputs.video_id }}
+          SUB_ID: ${{ github.event.inputs.sub_id }}
+          WM_ID: ${{ github.event.inputs.wm_id }}
+          WM_POS: ${{ github.event.inputs.wm_pos }}
+          RENAME: ${{ github.event.inputs.rename }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          USER_ID: ${{ github.event.inputs.user_id }}
+          RESOLUTION: ${{ github.event.inputs.resolution }}
+          FONT_LINK: ${{ github.event.inputs.font_link }}
+          TRIGGER_MSG_ID: ${{ github.event.inputs.trigger_msg_id }}
+        run: |
+          python studio.py
