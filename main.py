@@ -25,6 +25,10 @@ users_data = {}
 wm_positions = {} 
 task_queue = asyncio.Queue()
 
+# --- NEW: dedup lock to prevent the same video being dispatched twice ---
+active_video_locks = set()
+_lock_guard = asyncio.Lock()
+
 def is_authorized(m: Message):
     if not m.from_user: return False
     u_id = m.from_user.id
@@ -76,15 +80,33 @@ async def trigger_dispatch(task):
 async def queue_worker():
     while True:
         payload = await task_queue.get()
-        while await is_server_busy():
-            await asyncio.sleep(12)
-        ok, msg = await trigger_dispatch(payload)
-        if not ok:
-            print(f"Dispatch Error: {msg}")
-        task_queue.task_done()
+        dedup_key = payload.get("_dedup_key")
+        try:
+            while await is_server_busy():
+                await asyncio.sleep(12)
+            ok, msg = await trigger_dispatch(payload)
+            if not ok:
+                print(f"Dispatch Error: {msg}")
+        finally:
+            # Always release the lock once dispatch attempt is done (success or fail),
+            # so a genuinely new request for the same video can go through later.
+            if dedup_key:
+                async with _lock_guard:
+                    active_video_locks.discard(dedup_key)
+            task_queue.task_done()
 
-async def enqueue_task(payload):
+async def enqueue_task(payload, dedup_key=None):
+    """Adds a task to the queue. If dedup_key is given and a task with the same
+    key is already queued/dispatching, the new one is silently rejected instead
+    of being queued a second time — this is what was causing double-encodes."""
+    if dedup_key:
+        async with _lock_guard:
+            if dedup_key in active_video_locks:
+                return False
+            active_video_locks.add(dedup_key)
+        payload["_dedup_key"] = dedup_key
     await task_queue.put(payload)
+    return True
 
 async def get_pinned_file_link(chat_id, target_name):
     try:
@@ -166,20 +188,27 @@ async def compress_cmd(c, m: Message):
     
     cmd = RES_CMD_MAP[m.command[0].lower()]
     orig_name = getattr(media, "file_name", "output.mp4")
-    
-    is_busy = await is_server_busy()
-    status_text = "⏳ **Task Queued!**\nServer busy hain, aapka task queue me lag gaya hai aur turn aane par automatic start hoga." if is_busy else "⏳ **Task Dispatched to Cloud Processing Node...**"
-    
-    st = await m.reply(status_text)
-    font_link = await get_pinned_file_link(m.chat.id, "file")
+    video_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
 
+    # --- NEW: dedup key = same video + same target resolution ---
+    dedup_key = f"compress:{video_link}:{cmd}"
+
+    font_link = await get_pinned_file_link(m.chat.id, "file")
     payload = {
-        "task_type": "compress", "video_id": f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}",
+        "task_type": "compress", "video_id": video_link,
         "sub_id": "none", "chat_id": str(m.chat.id), "user_id": str(m.from_user.id),
         "resolution": cmd, "wm_id": "none", "wm_pos": "none", "rename": orig_name, 
-        "font_link": font_link, "trigger_msg_id": str(st.id)
+        "font_link": font_link, "trigger_msg_id": "none"
     }
-    await enqueue_task(payload)
+
+    is_busy = await is_server_busy()
+    status_text = "⏳ **Task Queued!**\nServer busy hain, aapka task queue me lag gaya hai aur turn aane par automatic start hoga." if is_busy else "⏳ **Task Dispatched to Cloud Processing Node...**"
+    st = await m.reply(status_text)
+    payload["trigger_msg_id"] = str(st.id)
+
+    accepted = await enqueue_task(payload, dedup_key=dedup_key)
+    if not accepted:
+        await st.edit("⚠️ **Ye video already process ho rahi hai (ya queue me hai).** Dobara request bhejne ki zaroorat nahi.")
 
 @app.on_message(filters.command("sub"))
 async def hsub_cmd(c, m: Message):
@@ -188,9 +217,15 @@ async def hsub_cmd(c, m: Message):
     if not media: 
         return await m.reply("❌ Hardsub ke liye video par reply karein.")
 
+    # --- NEW: if this exact video is already mid-setup or mid-dispatch, block re-entry ---
+    video_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
+    existing = next((u for u, s in users_data.items() if s.get("video_msg_id") == m.reply_to_message.id and s.get("chat_id") == m.chat.id), None)
+    if existing is not None or f"hardsub:{video_link}" in active_video_locks:
+        return await m.reply("⚠️ **Is video ka hardsub setup already chal raha hai / queue me hai.**")
+
     orig_name = getattr(media, "file_name", "output.mp4")
     await m.reply("Send subtitle file (.srt, .ass, .vtt) ya skip karne ke liye `S` type karein.")
-    users_data[m.from_user.id] = {"video_msg_id": m.reply_to_message.id, "chat_id": m.chat.id, "state": "WAIT_SUB", "rename": "none", "orig_name": orig_name}
+    users_data[m.from_user.id] = {"video_msg_id": m.reply_to_message.id, "chat_id": m.chat.id, "state": "WAIT_SUB", "rename": "none", "orig_name": orig_name, "video_link": video_link}
 
 async def prompt_watermark_or_execute(c, m, user_id, session):
     wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
@@ -257,7 +292,9 @@ async def replies_controller(c, m: Message):
 
 async def execute_dispatch_hardsub(user_id, msg: Message):
     data = users_data.pop(user_id)
-    
+    video_link = data.get("video_link", f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}")
+    dedup_key = f"hardsub:{video_link}"
+
     is_busy = await is_server_busy()
     status_text = "⏳ **Task Queued!**\nServer busy hain, aapka task queue me lag gaya hai aur turn aane par automatic start hoga." if is_busy else "⏳ **Task Dispatched to Cloud Processing Node...**"
     
@@ -269,12 +306,14 @@ async def execute_dispatch_hardsub(user_id, msg: Message):
         wm_pos = wm_positions.get(data["chat_id"], "right")
 
     payload = {
-        "task_type": "hardsub", "video_id": f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}",
+        "task_type": "hardsub", "video_id": video_link,
         "sub_id": data.get("sub_msg_link", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
         "resolution": "none", "wm_id": wm_link, "wm_pos": wm_pos, "rename": data.get("rename", "none"),
         "font_link": await get_pinned_file_link(data["chat_id"], "file"), "trigger_msg_id": str(st.id)
     }
-    await enqueue_task(payload)
+    accepted = await enqueue_task(payload, dedup_key=dedup_key)
+    if not accepted:
+        await st.edit("⚠️ **Ye video already process ho rahi hai (ya queue me hai).** Dobara request bhejne ki zaroorat nahi.")
 
 @app.on_callback_query(filters.regex("cancel_active_run"))
 async def cancel_run_callback(c, q: CallbackQuery):
