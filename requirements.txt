@@ -1,6 +1,0 @@
-pyrogram
-tgcrypto
-requests
-psutil
-pysubs2
-fontTools
