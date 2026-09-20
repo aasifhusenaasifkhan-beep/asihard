@@ -129,8 +129,19 @@ def inject_watermark(text, duration):
 
 
 # =========================================================
-# SUBTITLE HELPERS (file ka apna style bina chhede use hota hai)
+# SUBTITLE HELPERS
+# Dialogue ALWAYS uses the bot's own style (subtitle file ka style / tags ignore),
+# same look as the Colab bot: Arial Bold, white, black outline, bottom centre,
+# and never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
 # =========================================================
+PLAY_W, PLAY_H = 1920, 1080
+DLG_FONT_SIZE = 90
+DLG_OUTLINE = 4.5
+DLG_SHADOW = 3.5
+DLG_MARGIN_V = 70
+DLG_MARGIN_LR = 120
+
+
 def read_text_any(path):
     raw = open(path, "rb").read()
     if raw[:3] == b"\xef\xbb\xbf":
@@ -147,74 +158,87 @@ def is_ass_text(text):
     return bool(re.search(r"\[Script Info\]|\[V4\+?\s*Styles\]|\[Events\]", text[:6000], re.I))
 
 
-def apply_font_to_styles(text, font_name):
-    """Only when a custom font is pinned: swap the Fontname column, keep every other style value."""
-    out, sec, idx = [], None, None
-    for line in text.split("\n"):
-        s = line.strip()
-        low = s.lower()
-        if s.startswith("[") and s.endswith("]"):
-            sec, idx = low, None
-        elif sec and "styles" in sec:
-            if low.startswith("format:"):
-                fmt = [x.strip().lower() for x in s[7:].split(",")]
-                idx = fmt.index("fontname") if "fontname" in fmt else None
-            elif low.startswith("style:") and idx is not None:
-                head, _, body = line.partition(":")
-                parts = body.split(",")
-                if len(parts) > idx:
-                    parts[idx] = font_name
-                    line = head + ":" + ",".join(parts)
-        out.append(line)
-    return "\n".join(out)
+def _find_measure_font(custom_path=None):
+    """Font file used only to MEASURE text width (so we know when a line needs 2 lines / smaller size)."""
+    if custom_path and os.path.exists(custom_path):
+        return custom_path
+    try:
+        r = subprocess.run(["fc-match", "-f", "%{file}", "Arial:bold"], capture_output=True, text=True, timeout=10)
+        p = r.stdout.strip()
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    for p in ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"):
+        if os.path.exists(p):
+            return p
+    return None
 
 
-_COLOR_NAMES = {
-    "white": "ffffff", "black": "000000", "red": "ff0000", "green": "008000", "lime": "00ff00",
-    "blue": "0000ff", "yellow": "ffff00", "cyan": "00ffff", "aqua": "00ffff", "magenta": "ff00ff",
-    "orange": "ffa500", "gray": "808080", "grey": "808080", "pink": "ffc0cb", "purple": "800080",
-}
+class TextMeter:
+    def __init__(self, font_path):
+        self.ok = False
+        try:
+            f = TTFont(font_path, fontNumber=0)
+            self.cmap, self.hmtx = f.getBestCmap(), f["hmtx"]
+            upem = f["head"].unitsPerEm
+            os2, hh = f["OS/2"], f["hhea"]
+            # ASS Fontsize = line cell height (win ascent + descent), so px per font unit = fs / cell
+            self.cell = (os2.usWinAscent + os2.usWinDescent) or (hh.ascent - hh.descent) or upem
+            self.missing = int(0.62 * upem)     # glyphs the font lacks (e.g. Devanagari) -> libass falls back
+            self.ok = True
+        except Exception:
+            pass
+
+    def width(self, text, fs):
+        if not self.ok:
+            return len(text) * 0.47 * fs
+        total = 0
+        for ch in text:
+            g = self.cmap.get(ord(ch))
+            total += self.hmtx[g][0] if g is not None else self.missing
+        return total * fs / self.cell
 
 
-def _html_color_to_bgr(c):
-    c = c.strip().strip("\"'").lower()
-    c = _COLOR_NAMES.get(c, c)
-    m = re.fullmatch(r"#?([0-9a-f]{6})", c)
-    if not m:
-        m3 = re.fullmatch(r"#([0-9a-f]{3})", c)
-        if not m3:
-            return None
-        h = "".join(ch * 2 for ch in m3.group(1))
-    else:
-        h = m.group(1)
-    return (h[4:6] + h[2:4] + h[0:2]).upper()
+def layout_dialogue(lines, meter):
+    """lines -> ASS text with at most 2 lines. Keeps the author's own 1-2 line split when it fits,
+    otherwise re-wraps into 2 balanced lines, and shrinks the font for that cue only if 2 lines are not enough."""
+    lines = [l for l in lines if l.strip()]
+    if not lines:
+        return ""
+    fs = DLG_FONT_SIZE
+    limit = (PLAY_W - 2 * DLG_MARGIN_LR - 2 * DLG_OUTLINE) * 0.97
+
+    if len(lines) <= 2 and all(meter.width(l, fs) <= limit for l in lines):
+        return "\\N".join(lines)
+    flat = " ".join(lines)
+    if meter.width(flat, fs) <= limit:
+        return flat
+
+    words = flat.split(" ")
+    best = None
+    for i in range(1, len(words)):
+        a, b = " ".join(words[:i]), " ".join(words[i:])
+        m = max(meter.width(a, fs), meter.width(b, fs))
+        if best is None or m < best[0]:
+            best = (m, a + "\\N" + b)
+    if best is None:                       # one single very long word
+        best = (meter.width(flat, fs), flat)
+    worst, text = best
+    if worst <= limit:
+        return text
+    return "{\\fs%d}%s" % (max(30, int(fs * limit / worst)), text)
 
 
-def _convert_cue_text(t):
-    """SRT / VTT cue text -> ASS text, keeping italics / bold / underline / colour / font."""
-    t = t.replace("\r", "")
-
-    def font_open(m):
-        attrs, out = m.group(1), ""
-        cm = re.search(r"color\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", attrs, re.I)
-        if cm:
-            bgr = _html_color_to_bgr(cm.group(1))
-            if bgr:
-                out += f"\\c&H{bgr}&"
-        fm = re.search(r"face\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", attrs, re.I)
-        if fm:
-            out += "\\fn" + fm.group(1).strip("\"'")
-        return "{" + out + "}" if out else ""
-
-    t = re.sub(r"<font\b([^>]*)>", font_open, t, flags=re.I)
-    t = re.sub(r"</font\s*>", r"{\\c\\fn}", t, flags=re.I)
-    for tag, code in (("i", "i"), ("b", "b"), ("u", "u"), ("s", "s")):
-        t = re.sub(rf"<{tag}>", "{\\\\" + code + "1}", t, flags=re.I)
-        t = re.sub(rf"</{tag}>", "{\\\\" + code + "0}", t, flags=re.I)
-    t = re.sub(r"</?[A-Za-z][^>]*>", "", t)        # leftover html / vtt tags (<c.x>, <v Name>, <ruby> ...)
-    t = re.sub(r"<\d{1,2}:\d{2}[^>]*>", "", t)     # vtt karaoke timestamps
-    t = html.unescape(t)
-    return "\\N".join(x.strip() for x in t.split("\n")).strip()
+def _plain_lines(body):
+    """Cue text -> list of plain lines (all tags / styling removed)."""
+    body = re.sub(r"\{[^}]*\}", "", body)              # ass override tags
+    body = re.sub(r"<\d{1,2}:\d{2}[^>]*>", "", body)   # vtt karaoke timestamps
+    body = re.sub(r"</?[A-Za-z][^>]*>", "", body)      # <i> <b> <font ..> <c.x> <v ..>
+    body = html.unescape(body).replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
+    lines = [re.sub(r"\s+", " ", l).strip() for l in body.replace("\r", "").split("\n")]
+    return [l for l in lines if l]
 
 
 _TIME_RE = re.compile(
@@ -225,13 +249,9 @@ def _to_ms(h, m, s, ms):
     return ((int(h or 0) * 60 + int(m)) * 60 + int(s)) * 1000 + int(ms.ljust(3, "0"))
 
 
-def _ms_to_ass(ms):
-    return sec_to_ass_time(ms / 1000.0)
-
-
-def text_sub_to_ass(text, font_name):
+def _srt_vtt_cues(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
-    events = []
+    cues = []
     for block in re.split(r"\n\s*\n", text):
         lines = block.strip("\n").split("\n")
         if lines and lines[0].strip().upper().startswith(("NOTE", "STYLE", "REGION", "WEBVTT")) and \
@@ -244,40 +264,77 @@ def text_sub_to_ass(text, font_name):
         if not m:
             continue
         g = m.groups()
-        start, end = _to_ms(*g[0:4]), _to_ms(*g[4:8])
-        body = _convert_cue_text("\n".join(lines[ti + 1:]))
-        if body:
-            events.append((start, end, body))
-    if not events:
-        raise Exception("Subtitle file me koi valid line nahi mili.")
+        plain = _plain_lines("\n".join(lines[ti + 1:]))
+        if plain:
+            cues.append((sec_to_ass_time(_to_ms(*g[0:4]) / 1000.0), sec_to_ass_time(_to_ms(*g[4:8]) / 1000.0), plain))
+    return cues
 
-    # PlayRes 1920x1080; sizes below equal the old 24pt@288 look, so nothing changes visually.
+
+def _ass_cues(text):
+    """Only the dialogue text + timing is taken from an .ass; its styles / positions / effects are ignored.
+    Vector drawings and watermark/logo/credit styled lines are dropped (they are not dialogue)."""
+    cues, sec, fmt = [], None, None
+    for raw in text.split("\n"):
+        s = raw.strip()
+        low = s.lower()
+        if s.startswith("[") and s.endswith("]"):
+            sec, fmt = low, None
+        elif sec == "[events]":
+            if low.startswith("format:"):
+                fmt = [x.strip().lower() for x in s[7:].split(",")]
+            elif low.startswith("dialogue:") and fmt:
+                parts = s.split(":", 1)[1].lstrip().split(",", len(fmt) - 1)
+                if len(parts) < len(fmt):
+                    continue
+                d = dict(zip(fmt, parts))
+                txt = d.get("text", "")
+                if re.search(r"(watermark|logo|credit)", d.get("style", ""), re.I):
+                    continue
+                if re.search(r"\{[^}]*\\p[1-9]", txt):
+                    continue
+                plain = _plain_lines(txt)
+                if plain:
+                    cues.append((d.get("start", "0:00:00.00").strip(), d.get("end", "0:00:00.00").strip(), plain))
+    return cues
+
+
+def build_dialogue_ass(cues, font_name, bold, meter):
+    font_name = (font_name or "Arial").replace(",", " ")
     head = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n"
-        "ScaledBorderAndShadow: yes\nYCbCr Matrix: None\n\n"
+        "[Script Info]\nScriptType: v4.00+\n"
+        f"PlayResX: {PLAY_W}\nPlayResY: {PLAY_H}\n"
+        "WrapStyle: 0\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.601\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},90,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,"
-        "7,4,2,75,75,56,1\n\n"
+        f"Style: Default,{font_name},90,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
+        f"Style: Italic,{font_name},90,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,-1,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
+        f"Style: Flashback,{font_name},90,&H00FFFFFF,&H000000FF,&H00505050,&H00505050,-1,0,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
+        f"Style: Signs,{font_name},70,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,10,10,20,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    body = "\n".join(f"Dialogue: 0,{_ms_to_ass(s)},{_ms_to_ass(e)},Default,,0,0,0,,{tx}" for s, e, tx in events)
-    return head + body + "\n"
+    events = []
+    for start, end, lines in cues:
+        t = layout_dialogue(lines, meter)
+        if t:
+            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{t}")
+    if not events:
+        raise Exception("Subtitle file me koi valid dialogue nahi mila.")
+    return head + "\n".join(events) + "\n"
 
 
-def prepare_subtitle(sub_file, font_name, custom_font, duration, out_path="ready_sub.ass"):
+def prepare_subtitle(sub_file, font_name, custom_font, duration, out_path="ready_sub.ass", font_path=None):
     text = read_text_any(sub_file).replace("\r\n", "\n").replace("\r", "\n")
     if sub_file.lower().endswith((".ass", ".ssa")) or is_ass_text(text):
-        if custom_font:
-            text = apply_font_to_styles(text, font_name)
+        cues = _ass_cues(text)
     else:
-        text = text_sub_to_ass(text, font_name)
-    if not has_watermark_style(text):
-        text = inject_watermark(text, duration)
+        cues = _srt_vtt_cues(text)
+    meter = TextMeter(_find_measure_font(font_path if custom_font else None))
+    ass = build_dialogue_ass(cues, font_name, bold=not custom_font, meter=meter)
+    ass = inject_watermark(ass, duration)     # watermark code untouched
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write(ass)
     return out_path
 
 
@@ -630,7 +687,7 @@ async def main():
 
         extract_task = None
         if is_hardsub:
-            prepare_subtitle(sub_file, font_name, custom_font, duration)
+            prepare_subtitle(sub_file, font_name, custom_font, duration, font_path=font_path)
             vf = f"{scale_stage},subtitles='ready_sub.ass':charenc=UTF-8"
             if custom_font:
                 vf += ":fontsdir=fonts"
