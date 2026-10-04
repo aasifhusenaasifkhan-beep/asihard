@@ -135,7 +135,7 @@ def inject_watermark(text, duration):
 # and never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
 # =========================================================
 PLAY_W, PLAY_H = 1920, 1080
-DLG_FONT_SIZE = 90
+DLG_FONT_SIZE = 80
 DLG_OUTLINE = 4.5
 DLG_SHADOW = 3.5
 DLG_MARGIN_V = 70
@@ -558,13 +558,17 @@ def pick_rate(effective_height):
     return "700k", "1400k"
 
 
-def build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size):
-    return [
+def build_ffmpeg_cmd(video_file, vf, out_name, max_rate=None, buf_size=None, preset="ultrafast", crf="26"):
+    cmd = [
         "ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
         "-i", video_file, "-vf", vf,
         "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-        "-maxrate", max_rate, "-bufsize", buf_size,
+        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+    ]
+    # bitrate cap sirf tab lagta hai jab max_rate/buf_size diye gaye ho (compress task)
+    if max_rate and buf_size:
+        cmd += ["-maxrate", max_rate, "-bufsize", buf_size]
+    cmd += [
         "-pix_fmt", "yuv420p", "-threads", "0",
         # keyframe every 2s (IDR) -> seeking anywhere in the player starts instantly
         "-force_key_frames", "expr:gte(t,n_forced*2)", "-forced-idr", "1",
@@ -572,6 +576,7 @@ def build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size):
         "-max_muxing_queue_size", "1024",
         "-movflags", "+faststart", out_name,
     ]
+    return cmd
 
 
 async def run_ffmpeg(cmd, duration, title):
@@ -681,7 +686,16 @@ async def main():
         reso_clean = str(RESOLUTION or "").replace("p", "").replace("P", "").strip()
         has_reso = reso_clean.isdigit()
         effective_height = int(reso_clean) if has_reso else vid_height
-        max_rate, buf_size = pick_rate(effective_height)
+        if is_hardsub:
+            # Hardsub: quality high (CRF 19, veryfast) + size source ke ~115% se upar nahi jaaye
+            # (300 MB source -> max ~345-350 MB). Cap source ke apne bitrate se nikalta hai.
+            src_kbps = os.path.getsize(video_file) * 8 / duration / 1000
+            cap_kbps = max(600, int(src_kbps * 1.15) - 96)      # 96k audio ke liye jagah
+            max_rate, buf_size = f"{cap_kbps}k", f"{cap_kbps * 2}k"
+            enc_preset, enc_crf = "veryfast", "19"
+        else:
+            max_rate, buf_size = pick_rate(effective_height)
+            enc_preset, enc_crf = "ultrafast", "26"
         # (-2 keeps width even; min(...) never upscales; trunc keeps height even)
         scale_stage = f"scale=-2:'min({reso_clean},trunc(ih/2)*2)'" if has_reso else "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
@@ -698,7 +712,7 @@ async def main():
             extract_task = asyncio.create_task(extract_embedded_subs(video_file, base_name))
 
         await update_http_status(f"⚙️ <b>{title}</b>\n<code>{get_process_bar(0)}</code> [0.0%]")
-        await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size), duration, title)
+        await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size, enc_preset, enc_crf), duration, title)
 
         # ---- upload (as document) ----
         await update_http_status(f"📤 <b>Sending Video</b>\n<code>{get_send_bar(0)}</code> [0.0%]")
