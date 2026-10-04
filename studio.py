@@ -558,13 +558,16 @@ def pick_rate(effective_height):
     return "700k", "1400k"
 
 
-def build_ffmpeg_cmd(video_file, vf, out_name, max_rate=None, buf_size=None, preset="ultrafast", crf="26"):
+def build_ffmpeg_cmd(video_file, vf, out_name, max_rate=None, buf_size=None, preset="ultrafast", crf="26",
+                     target_rate=None):
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
         "-i", video_file, "-vf", vf,
         "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        "-c:v", "libx264", "-preset", preset,
     ]
+    # target_rate diya ho to bitrate fix (size source ke barabar), warna CRF (quality-based)
+    cmd += ["-b:v", target_rate] if target_rate else ["-crf", crf]
     # bitrate cap sirf tab lagta hai jab max_rate/buf_size diye gaye ho (compress task)
     if max_rate and buf_size:
         cmd += ["-maxrate", max_rate, "-bufsize", buf_size]
@@ -689,11 +692,15 @@ async def main():
         if is_hardsub:
             # Hardsub: quality high (CRF 19, veryfast) + size source ke ~115% se upar nahi jaaye
             # (300 MB source -> max ~345-350 MB). Cap source ke apne bitrate se nikalta hai.
+            # CRF size guarantee nahi deta (simple scenes me bahut chhota ho jaata hai),
+            # isliye target bitrate = source ka bitrate (audio hata ke). Size ~source ke barabar.
             src_kbps = os.path.getsize(video_file) * 8 / duration / 1000
-            cap_kbps = max(600, int(src_kbps * 1.15) - 96)      # 96k audio ke liye jagah
-            max_rate, buf_size = f"{cap_kbps}k", f"{cap_kbps * 2}k"
+            tgt_kbps = max(600, int(src_kbps - 96))
+            target_rate = f"{tgt_kbps}k"
+            max_rate, buf_size = f"{int(tgt_kbps * 1.5)}k", f"{tgt_kbps * 3}k"
             enc_preset, enc_crf = "veryfast", "19"
         else:
+            target_rate = None
             max_rate, buf_size = pick_rate(effective_height)
             enc_preset, enc_crf = "ultrafast", "26"
         # (-2 keeps width even; min(...) never upscales; trunc keeps height even)
@@ -712,7 +719,7 @@ async def main():
             extract_task = asyncio.create_task(extract_embedded_subs(video_file, base_name))
 
         await update_http_status(f"⚙️ <b>{title}</b>\n<code>{get_process_bar(0)}</code> [0.0%]")
-        await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size, enc_preset, enc_crf), duration, title)
+        await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size, enc_preset, enc_crf, target_rate), duration, title)
 
         # ---- upload (as document) ----
         await update_http_status(f"📤 <b>Sending Video</b>\n<code>{get_send_bar(0)}</code> [0.0%]")
