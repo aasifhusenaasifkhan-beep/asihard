@@ -283,10 +283,20 @@ def _ass_cues(text):
             if low.startswith("format:"):
                 fmt = [x.strip().lower() for x in s[7:].split(",")]
             elif low.startswith("dialogue:") and fmt:
-                parts = s.split(":", 1)[1].lstrip().split(",", len(fmt) - 1)
+                body = s.split(":", 1)[1].lstrip()
+                parts = body.split(",", len(fmt) - 1)
                 if len(parts) < len(fmt):
-                    continue
-                d = dict(zip(fmt, parts))
+                    # Kuch tools Format me 10 field likhte hain par Dialogue me sirf
+                    # Layer,Start,End,Style,Name,Text (6) bhejte hain -> alag se parse karo.
+                    p = body.split(",", 5)
+                    if len(p) == 6:
+                        d = dict(zip(["layer", "start", "end", "style", "name", "text"], p))
+                    elif len(p) == 5:
+                        d = dict(zip(["layer", "start", "end", "style", "text"], p))
+                    else:
+                        continue
+                else:
+                    d = dict(zip(fmt, parts))
                 txt = d.get("text", "")
                 if re.search(r"(watermark|logo|credit)", d.get("style", ""), re.I):
                     continue
