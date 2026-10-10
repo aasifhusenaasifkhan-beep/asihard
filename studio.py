@@ -135,11 +135,15 @@ def inject_watermark(text, duration):
 # and never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
 # =========================================================
 PLAY_W, PLAY_H = 1920, 1080
-DLG_FONT_SIZE = 80
-DLG_OUTLINE = 4.5
-DLG_SHADOW = 3.5
-DLG_MARGIN_V = 70
-DLG_MARGIN_LR = 120
+# Dialogue style (measuring/wrap aur asli ASS style dono yahi values use karte hain)
+DLG_FONT_SIZE = 82
+DLG_OUTLINE = 7
+DLG_SHADOW = 4
+DLG_MARGIN_V = 60
+DLG_MARGIN_LR = 40
+DLG_SCALE_X = 94
+DLG_SPACING = 1
+DLG_FAKE_BOLD = False   # True karo to text aur bhaari dikhega (extra white-border layer)
 
 
 def read_text_any(path):
@@ -210,21 +214,24 @@ def layout_dialogue(lines, meter):
     fs = DLG_FONT_SIZE
     limit = (PLAY_W - 2 * DLG_MARGIN_LR - 2 * DLG_OUTLINE) * 0.97
 
-    if len(lines) <= 2 and all(meter.width(l, fs) <= limit for l in lines):
+    def mw(t):                             # ScaleX ke hisaab se asli width
+        return meter.width(t, fs) * DLG_SCALE_X / 100.0 + len(t) * DLG_SPACING
+
+    if len(lines) <= 2 and all(mw(l) <= limit for l in lines):
         return "\\N".join(lines)
     flat = " ".join(lines)
-    if meter.width(flat, fs) <= limit:
+    if mw(flat) <= limit:
         return flat
 
     words = flat.split(" ")
     best = None
     for i in range(1, len(words)):
         a, b = " ".join(words[:i]), " ".join(words[i:])
-        m = max(meter.width(a, fs), meter.width(b, fs))
+        m = max(mw(a), mw(b))
         if best is None or m < best[0]:
             best = (m, a + "\\N" + b)
     if best is None:                       # one single very long word
-        best = (meter.width(flat, fs), flat)
+        best = (mw(flat), flat)
     worst, text = best
     if worst <= limit:
         return text
@@ -313,14 +320,14 @@ def build_dialogue_ass(cues, font_name, bold, meter):
     head = (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {PLAY_W}\nPlayResY: {PLAY_H}\n"
-        "WrapStyle: 0\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.601\n\n"
+        "WrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.601\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},90,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
-        f"Style: Italic,{font_name},90,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,-1,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
-        f"Style: Flashback,{font_name},90,&H00FFFFFF,&H000000FF,&H00505050,&H00505050,-1,0,0,0,100,100,0,0,1,4.5,3.5,2,120,120,70,1\n"
+        f"Style: Default,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
+        f"Style: Italic,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,-1,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
+        f"Style: Flashback,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00505050,&H00505050,-1,0,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
         f"Style: Signs,{font_name},70,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,10,10,20,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -329,6 +336,8 @@ def build_dialogue_ass(cues, font_name, bold, meter):
         t = layout_dialogue(lines, meter)
         if t:
             events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{t}")
+            if DLG_FAKE_BOLD:
+                events.append(f"Dialogue: 1,{start},{end},Default,,0,0,0,,{{\\bord1.6\\3c&HFFFFFF&\\shad0}}{t}")
     if not events:
         raise Exception("Subtitle file me koi valid dialogue nahi mila.")
     return head + "\n".join(events) + "\n"
@@ -708,7 +717,7 @@ async def main():
             tgt_kbps = max(600, int(src_kbps - 96))
             target_rate = f"{tgt_kbps}k"
             max_rate, buf_size = f"{int(tgt_kbps * 1.5)}k", f"{tgt_kbps * 3}k"
-            enc_preset, enc_crf = "veryfast", "19"
+            enc_preset, enc_crf = "ultrafast", "19"   # speed ke liye ultrafast; size target_rate se fix
         else:
             target_rate = None
             max_rate, buf_size = pick_rate(effective_height)
