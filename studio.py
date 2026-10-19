@@ -141,8 +141,8 @@ def inject_watermark(text, duration):
 PLAY_W, PLAY_H = 1920, 1080
 # Dialogue style (measuring/wrap aur asli ASS style dono yahi values use karte hain)
 DLG_FONT_SIZE = 82
-DLG_OUTLINE = 7
-DLG_SHADOW = 4
+DLG_OUTLINE = 5
+DLG_SHADOW = 2
 DLG_MARGIN_V = 60
 DLG_MARGIN_LR = 40
 DLG_SCALE_X = 94
