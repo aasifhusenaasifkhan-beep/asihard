@@ -17,9 +17,14 @@ SUB_ID = os.getenv("SUB_ID")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 RESOLUTION = os.getenv("RESOLUTION")
 RENAME = os.getenv("RENAME")
-FONT_LINK = os.getenv("FONT_LINK")
 TRIGGER_MSG_ID = os.getenv("TRIGGER_MSG_ID")
 RUN_ID = (os.getenv("GITHUB_RUN_ID") or "").strip()   # set automatically by GitHub Actions
+
+# ---------------------------------------------------------
+# HARDSUB FONT: repo ke is folder se aata hai (Telegram se nahi)
+# ---------------------------------------------------------
+FONT_DIR = "fonts"                 # repo me folder ka naam (studio.py ke bagal me)
+PREFERRED_FONT = "RoundSub-Bold.ttf"  # pehle ye file dhundhega, na mile to folder ki pehli font file
 
 _user_id_raw = os.getenv("USER_ID")
 USER_ID = int(_user_id_raw) if _user_id_raw and _user_id_raw.strip().lower() != "none" else CHAT_ID
@@ -33,7 +38,6 @@ TRANSFER_TIMEOUT = 2400
 last_time = 0
 start_time = 0
 status_msg_id = None
-os.makedirs("fonts", exist_ok=True)
 
 
 def is_set(v):
@@ -130,9 +134,9 @@ def inject_watermark(text, duration):
 
 # =========================================================
 # SUBTITLE HELPERS
-# Dialogue ALWAYS uses the bot's own style (subtitle file ka style / tags ignore),
-# same look as the Colab bot: Arial Bold, white, black outline, bottom centre,
-# and never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
+# Dialogue ALWAYS uses the bot's own style (subtitle file ka style / tags ignore).
+# Hardsub me font repo ke FONT_DIR folder se aata hai.
+# Never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
 # =========================================================
 PLAY_W, PLAY_H = 1920, 1080
 # Dialogue style (measuring/wrap aur asli ASS style dono yahi values use karte hain)
@@ -160,6 +164,22 @@ def read_text_any(path):
 
 def is_ass_text(text):
     return bool(re.search(r"\[Script Info\]|\[V4\+?\s*Styles\]|\[Events\]", text[:6000], re.I))
+
+
+def find_repo_font():
+    """Repo ke FONT_DIR folder se font file. PREFERRED_FONT mile to wahi, warna pehli .ttf/.otf/.ttc."""
+    if not os.path.isdir(FONT_DIR):
+        print(f"Font folder '{FONT_DIR}' not found in repo")
+        return None
+    files = sorted(os.listdir(FONT_DIR))
+    for f in files:
+        if f.lower() == PREFERRED_FONT.lower():
+            return os.path.join(FONT_DIR, f)
+    for f in files:
+        if f.lower().endswith((".ttf", ".otf", ".ttc")):
+            return os.path.join(FONT_DIR, f)
+    print(f"No font file inside '{FONT_DIR}'")
+    return None
 
 
 def _find_measure_font(custom_path=None):
@@ -358,11 +378,13 @@ def prepare_subtitle(sub_file, font_name, custom_font, duration, out_path="ready
 
 
 def get_font_name(font_path):
+    """Family name (nameID 1) pehle, na mile to full name (nameID 4). libass family name se match karta hai."""
     try:
         font = TTFont(font_path, fontNumber=0)
-        for record in font["name"].names:
-            if record.nameID == 4:
-                return record.toUnicode()
+        for want in (1, 4):
+            for record in font["name"].names:
+                if record.nameID == want:
+                    return record.toUnicode()
     except Exception:
         pass
     return "Arial"
@@ -675,15 +697,15 @@ async def main():
         is_hardsub = TASK_TYPE == "hardsub"
         step_dl = "hardsub_download" if is_hardsub else "compress_download"
 
-        # ---- downloads: video starts right away, subtitle + font (tiny) fetched alongside ----
+        # ---- downloads: video starts right away, subtitle (tiny) fetched alongside ----
+        # Font Telegram se nahi aata: hardsub ke time repo ke FONT_DIR folder se liya jaata hai.
         video_task = asyncio.create_task(download_tg_link(app, VIDEO_ID, "video.mkv", step_dl, min_size=10000))
-        sub_file = font_path = None
+        sub_file = None
         try:
             if is_hardsub:
                 sub_file = await download_tg_link(app, SUB_ID, "sub_raw", "sub", show_progress=False)
                 if not sub_file:
                     raise Exception("Subtitle file not found or download failed.")
-            font_path = await download_tg_link(app, FONT_LINK, "fonts/", "font", show_progress=False)
         except Exception:
             video_task.cancel()
             raise
@@ -701,16 +723,17 @@ async def main():
         base_name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", base_name).strip()[:120] or "output"
         out_name = f"{base_name}.mp4"
 
-        custom_font = bool(font_path) and font_path.lower().endswith((".ttf", ".otf", ".ttc"))
+        font_path = find_repo_font() if is_hardsub else None
+        custom_font = bool(font_path)
         font_name = get_font_name(font_path) if custom_font else "Arial"
+        if is_hardsub:
+            print(f"Hardsub font: {font_path} -> family '{font_name}'", flush=True)
 
         # ---- resolution / bitrate bucket ----
         reso_clean = str(RESOLUTION or "").replace("p", "").replace("P", "").strip()
         has_reso = reso_clean.isdigit()
         effective_height = int(reso_clean) if has_reso else vid_height
         if is_hardsub:
-            # Hardsub: quality high (CRF 19, veryfast) + size source ke ~115% se upar nahi jaaye
-            # (300 MB source -> max ~345-350 MB). Cap source ke apne bitrate se nikalta hai.
             # CRF size guarantee nahi deta (simple scenes me bahut chhota ho jaata hai),
             # isliye target bitrate = source ka bitrate (audio hata ke). Size ~source ke barabar.
             src_kbps = os.path.getsize(video_file) * 8 / duration / 1000
@@ -730,7 +753,7 @@ async def main():
             prepare_subtitle(sub_file, font_name, custom_font, duration, font_path=font_path)
             vf = f"{scale_stage},subtitles='ready_sub.ass':charenc=UTF-8"
             if custom_font:
-                vf += ":fontsdir=fonts"
+                vf += f":fontsdir={FONT_DIR}"
             title = "Encoding Hardsub"
         else:
             vf = scale_stage
