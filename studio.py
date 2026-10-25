@@ -125,6 +125,14 @@ def inject_watermark(text, duration):
     }
     event_line = "Dialogue: " + ",".join(ev_vals.get(n.lower(), "0") for n in ev_fmt)
 
+    # Join-channel message: sirf pehle 5 second, top-left
+    msg_vals = dict(ev_vals)
+    msg_vals["end"] = sec_to_ass_time(min(5.0, duration))
+    msg_vals["text"] = (f"{{\\an7\\pos({40*k:.0f},{30*k:.0f})\\fs{48*k:.0f}\\bord{4*k:.1f}\\shad{2*k:.1f}}}"
+                        "Join telegram channel\\Nhttps://t.me/asi_anime")
+    msg_line = "Dialogue: " + ",".join(msg_vals.get(n.lower(), "0") for n in ev_fmt)
+    event_line = event_line + "\n" + msg_line
+
     ev_pos = last_event if last_event is not None else ev_fmt_idx
     # insert the later position first so the earlier index stays valid
     for pos, line in sorted([(ev_pos, event_line), (last_style, style_line)], reverse=True):
@@ -140,7 +148,7 @@ def inject_watermark(text, duration):
 # =========================================================
 PLAY_W, PLAY_H = 1920, 1080
 # Dialogue style (measuring/wrap aur asli ASS style dono yahi values use karte hain)
-DLG_FONT_SIZE = 82
+DLG_FONT_SIZE = 80
 DLG_OUTLINE = 5
 DLG_SHADOW = 2
 DLG_MARGIN_V = 60
@@ -345,10 +353,7 @@ def build_dialogue_ass(cues, font_name, bold, meter):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
-        f"Style: Italic,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,-1,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
-        f"Style: Flashback,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00505050,&H00505050,-1,0,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n"
-        f"Style: Signs,{font_name},70,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,10,10,20,1\n\n"
+        f"Style: Default,{font_name},{DLG_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,{DLG_SCALE_X},100,{DLG_SPACING},0,1,{DLG_OUTLINE},{DLG_SHADOW},2,{DLG_MARGIN_LR},{DLG_MARGIN_LR},{DLG_MARGIN_V},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events = []
@@ -734,13 +739,10 @@ async def main():
         has_reso = reso_clean.isdigit()
         effective_height = int(reso_clean) if has_reso else vid_height
         if is_hardsub:
-            # CRF size guarantee nahi deta (simple scenes me bahut chhota ho jaata hai),
-            # isliye target bitrate = source ka bitrate (audio hata ke). Size ~source ke barabar.
-            src_kbps = os.path.getsize(video_file) * 8 / duration / 1000
-            tgt_kbps = max(600, int(src_kbps - 96))
-            target_rate = f"{tgt_kbps}k"
-            max_rate, buf_size = f"{int(tgt_kbps * 1.5)}k", f"{tgt_kbps * 3}k"
-            enc_preset, enc_crf = "ultrafast", "19"   # speed ke liye ultrafast; size target_rate se fix
+            # Hardsub: size ki koi limit nahi, sirf quality (CRF). Chhota number = better quality, badi file.
+            target_rate = None
+            max_rate, buf_size = None, None
+            enc_preset, enc_crf = "ultrafast", "18"
         else:
             target_rate = None
             max_rate, buf_size = pick_rate(effective_height)
