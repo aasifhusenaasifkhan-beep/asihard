@@ -23,7 +23,7 @@ RUN_ID = (os.getenv("GITHUB_RUN_ID") or "").strip()   # set automatically by Git
 # ---------------------------------------------------------
 # HARDSUB FONT: repo ke is folder se aata hai (Telegram se nahi)
 # ---------------------------------------------------------
-FONT_DIR = "font"                 # repo me folder ka naam (studio.py ke bagal me)
+FONT_DIR = "fonts"                 # repo me folder ka naam (studio.py ke bagal me)
 PREFERRED_FONT = "RoundSub-Bold.ttf"  # pehle ye file dhundhega, na mile to folder ki pehli font file
 
 # ---------------------------------------------------------
