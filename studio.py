@@ -23,8 +23,25 @@ RUN_ID = (os.getenv("GITHUB_RUN_ID") or "").strip()   # set automatically by Git
 # ---------------------------------------------------------
 # HARDSUB FONT: repo ke is folder se aata hai (Telegram se nahi)
 # ---------------------------------------------------------
-FONT_DIR = "fonts"                 # repo me folder ka naam (studio.py ke bagal me)
+FONT_DIR = "font"                 # repo me folder ka naam (studio.py ke bagal me)
 PREFERRED_FONT = "RoundSub-Bold.ttf"  # pehle ye file dhundhega, na mile to folder ki pehli font file
+
+# ---------------------------------------------------------
+# HARDSUB ENCODE SETTINGS (yahan se size/speed control hota hai)
+# ---------------------------------------------------------
+HARDSUB_PRESET = "veryfast"       # ultrafast se machchar (mosquito noise) aata tha
+HARDSUB_CRF = "23"                # bada number = chhoti file
+HARDSUB_MAXRATE = "3000k"         # video bitrate ki upper limit (24 min episode ~ 450-540MB)
+HARDSUB_BUFSIZE = "6000k"         # maxrate ka double
+# size (MB) ~= bitrate(kbps) x seconds / 8000  -> lamba episode ho to MAXRATE kam karo
+
+# ---------------------------------------------------------
+# TELEGRAM DOWNLOAD SPEED
+# Video file ko DL_PARTS hisso me todke ek saath download karta hai (single stream se kaafi fast).
+# Fail ho to apne aap normal download par aa jaata hai.
+# ---------------------------------------------------------
+DL_PARTS = 8
+CHUNK = 1024 * 1024
 
 _user_id_raw = os.getenv("USER_ID")
 USER_ID = int(_user_id_raw) if _user_id_raw and _user_id_raw.strip().lower() != "none" else CHAT_ID
@@ -42,6 +59,22 @@ status_msg_id = None
 
 def is_set(v):
     return bool(v) and str(v).strip().lower() not in ("none", "")
+
+
+def fmt_dur(sec):
+    sec = int(max(0, sec))
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def sys_info():
+    cpu = os.cpu_count() or 1
+    ram = "?"
+    try:
+        kb = int(re.search(r"MemTotal:\s+(\d+)", open("/proc/meminfo").read()).group(1))
+        ram = f"{kb / 1048576:.1f} GB"
+    except Exception:
+        pass
+    return cpu, ram
 
 
 # =========================================================
@@ -491,6 +524,44 @@ def get_video_dimensions_and_duration(video_path):
     return width, height, duration
 
 
+async def fast_download(app_instance, media, path, step_name):
+    """Large file ko DL_PARTS hisso me parallel download karta hai.
+    Chhoti file (<5MB) ya koi dikkat ho to None / Exception -> caller normal download karta hai."""
+    size = getattr(media, "file_size", 0) or 0
+    if size < 5 * CHUNK:
+        return None
+    total_chunks = (size + CHUNK - 1) // CHUNK
+    parts = max(1, min(DL_PARTS, total_chunks))
+    per = (total_chunks + parts - 1) // parts
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+    os.ftruncate(fd, size)
+    done = [0]
+
+    async def worker(start, count):
+        pos = start * CHUNK
+        async for chunk in app_instance.stream_media(media.file_id, limit=count, offset=start):
+            os.pwrite(fd, chunk, pos)
+            pos += len(chunk)
+            done[0] += len(chunk)
+            await prog(done[0], size, app_instance, step_name)
+
+    tasks = [asyncio.create_task(worker(i * per, min(per, total_chunks - i * per)))
+             for i in range(parts) if i * per < total_chunks]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        os.close(fd)
+    return path
+
+
 async def download_tg_link(app_instance, link, output_path, step_name, min_size=1, show_progress=True):
     if not is_set(link):
         return None
@@ -501,9 +572,31 @@ async def download_tg_link(app_instance, link, output_path, step_name, min_size=
             if msg and (msg.document or msg.video or msg.photo or msg.animation):
                 if show_progress:
                     reset_prog()
-                kw = dict(progress=prog, progress_args=(app_instance, step_name)) if show_progress else {}
-                downloaded = await asyncio.wait_for(
-                    app_instance.download_media(msg, file_name=output_path, **kw), timeout=TRANSFER_TIMEOUT)
+                downloaded = None
+
+                # 1) tez tareeka: parallel parts (sirf badi video par, pehli koshish me)
+                media = msg.video or msg.document or msg.animation
+                if show_progress and attempt == 1 and media is not None:
+                    try:
+                        downloaded = await asyncio.wait_for(
+                            fast_download(app_instance, media, output_path, step_name),
+                            timeout=TRANSFER_TIMEOUT)
+                        if downloaded and (not os.path.exists(downloaded) or
+                                           os.path.getsize(downloaded) < (media.file_size or 0) * 0.99):
+                            print("Fast download incomplete -> normal download")
+                            downloaded = None
+                    except Exception as e:
+                        print(f"Fast download failed ({e!r}) -> normal download")
+                        downloaded = None
+
+                # 2) normal tareeka (fallback)
+                if not downloaded:
+                    if show_progress:
+                        reset_prog()
+                    kw = dict(progress=prog, progress_args=(app_instance, step_name)) if show_progress else {}
+                    downloaded = await asyncio.wait_for(
+                        app_instance.download_media(msg, file_name=output_path, **kw), timeout=TRANSFER_TIMEOUT)
+
                 if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) >= min_size:
                     return downloaded
             else:
@@ -612,9 +705,12 @@ def build_ffmpeg_cmd(video_file, vf, out_name, max_rate=None, buf_size=None, pre
         "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
         "-c:v", "libx264", "-preset", preset,
     ]
+    # anime ke liye: banding / noise kam (ultrafast me tune kaam nahi karta, isliye skip)
+    if preset != "ultrafast":
+        cmd += ["-tune", "animation"]
     # target_rate diya ho to bitrate fix (size source ke barabar), warna CRF (quality-based)
     cmd += ["-b:v", target_rate] if target_rate else ["-crf", crf]
-    # bitrate cap sirf tab lagta hai jab max_rate/buf_size diye gaye ho (compress task)
+    # bitrate cap sirf tab lagta hai jab max_rate/buf_size diye gaye ho
     if max_rate and buf_size:
         cmd += ["-maxrate", max_rate, "-bufsize", buf_size]
     cmd += [
@@ -701,6 +797,7 @@ async def main():
     try:
         is_hardsub = TASK_TYPE == "hardsub"
         step_dl = "hardsub_download" if is_hardsub else "compress_download"
+        t_begin = time.time()
 
         # ---- downloads: video starts right away, subtitle (tiny) fetched alongside ----
         # Font Telegram se nahi aata: hardsub ke time repo ke FONT_DIR folder se liya jaata hai.
@@ -717,6 +814,8 @@ async def main():
         video_file = await video_task
         if not video_file:
             raise Exception("Video download failed or file is 0 bytes.")
+        t_dl = time.time()
+        in_size_mb = os.path.getsize(video_file) / 1048576
 
         vid_width, vid_height, duration = get_video_dimensions_and_duration(video_file)
         if duration <= 0:
@@ -739,10 +838,11 @@ async def main():
         has_reso = reso_clean.isdigit()
         effective_height = int(reso_clean) if has_reso else vid_height
         if is_hardsub:
-            # Hardsub: size ki koi limit nahi, sirf quality (CRF). Chhota number = better quality, badi file.
+            # Hardsub: ultrafast (speed full) + bitrate cap taaki size 400MB ke andar rahe.
+            # Settings upar HARDSUB_* constants me hain.
             target_rate = None
-            max_rate, buf_size = None, None
-            enc_preset, enc_crf = "ultrafast", "18"
+            max_rate, buf_size = HARDSUB_MAXRATE, HARDSUB_BUFSIZE
+            enc_preset, enc_crf = HARDSUB_PRESET, HARDSUB_CRF
         else:
             target_rate = None
             max_rate, buf_size = pick_rate(effective_height)
@@ -763,12 +863,35 @@ async def main():
             extract_task = asyncio.create_task(extract_embedded_subs(video_file, base_name))
 
         await update_http_status(f"⚙️ <b>{title}</b>\n<code>{get_process_bar(0)}</code> [0.0%]")
+        t_enc0 = time.time()
         await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size, enc_preset, enc_crf, target_rate), duration, title)
+        t_enc1 = time.time()
 
         # ---- upload (as document) ----
         await update_http_status(f"📤 <b>Sending Video</b>\n<code>{get_send_bar(0)}</code> [0.0%]")
-        await deliver_video_asset(app, CHAT_ID, USER_ID, out_name,
-                                  f"✅ <b>Process Completed!</b>\n<code>{html.escape(out_name)}</code>", prog)
+        sent = await deliver_video_asset(app, CHAT_ID, USER_ID, out_name,
+                                         f"✅ <b>Process Completed!</b>\n<code>{html.escape(out_name)}</code>", prog)
+        t_up = time.time()
+
+        # ---- time report: kaunsa step kitna time le raha hai ----
+        try:
+            cpu, ram = sys_info()
+            out_size_mb = os.path.getsize(out_name) / 1048576
+            spd = duration / (t_enc1 - t_enc0) if t_enc1 > t_enc0 else 0
+            label = "Hardsub" if is_hardsub else "Compress"
+            report = (
+                f"⏱ <b>Time Report</b>\n"
+                f"📥 Download: <b>{fmt_dur(t_dl - t_begin)}</b>\n"
+                f"🔥 {label}: <b>{fmt_dur(t_enc1 - t_enc0)}</b> ({spd:.1f}x)\n"
+                f"📤 Upload: <b>{fmt_dur(t_up - t_enc1)}</b>\n"
+                f"🕒 Total: <b>{fmt_dur(t_up - t_begin)}</b>\n"
+                f"📦 Size: {in_size_mb:.0f} MB → <b>{out_size_mb:.0f} MB</b>\n"
+                f"🧠 CPU: {cpu} | RAM: {ram}")
+            print(re.sub(r"<[^>]+>", "", report), flush=True)
+            dest = getattr(getattr(sent, "chat", None), "id", None) or USER_ID
+            await app.send_message(dest, report, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"Time report failed: {e}")
 
         if extract_task:
             for sub_f in await extract_task:
