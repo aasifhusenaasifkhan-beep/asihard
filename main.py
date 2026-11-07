@@ -26,6 +26,9 @@ app = Client("HarsubBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
 users_data = {}
 task_queue = asyncio.Queue()
 
+# Reply me jo link ho (direct / .torrent / magnet) use pakadne ke liye
+LINK_RE = re.compile(r"(https?://\S+|magnet:\?\S+)", re.I)
+
 
 def gh_headers():
     return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -162,6 +165,9 @@ async def general_cmds(c, m: Message):
             "🤖 **Bot Usage Guide:**\n\n"
             "1️⃣ **Compress Video:** Video par reply karein `/1080g`, `/720g`, ya `/480g`\n"
             "2️⃣ **Hardsub Video:** Video par reply karein `/sub` aur subtitle send karein.\n"
+            "🔗 **Link se Hardsub:** Pehle link (direct / .torrent / magnet) bhejein, us link par reply karein `/sub`, phir apni subtitle bhejein. "
+            "Video seedha link se download hogi, video me pehle se jo subtitle hai wo burn nahi hogi, sirf aapki di hui.\n"
+            "🔹 **Softsub (.ass):** Video ya link par reply karein `/softsub`, phir subtitle file send karein. (re-encode nahi hota, `.mkv` milti hai)\n"
             "3️⃣ **Custom Font:** Font file par reply karke `/addfont` (hatane ke liye `/removefont`)\n"
             "4️⃣ **Cancel Setup State:** `/cancel` type karein."
         )
@@ -209,6 +215,23 @@ def _replied_media(m: Message):
     return (r.video or r.document or r.animation) if r else None
 
 
+def _video_source(m: Message):
+    """Reply kis cheez par hua? -> (video_id, orig_name) ya None.
+    - video/document par: Telegram message ka link (pehle jaisa)
+    - text me link (direct / .torrent / magnet) par: wahi link, workflow khud download karega
+      (orig_name 'none' -> 'Same name' me naam download hui file se banega)"""
+    r = m.reply_to_message
+    if not r:
+        return None
+    media = r.video or r.document or r.animation
+    if media:
+        return f"https://t.me/c/{str(m.chat.id)[4:]}/{r.id}", file_name_of(media)
+    found = LINK_RE.search(r.text or r.caption or "")
+    if found:
+        return found.group(1), "none"
+    return None
+
+
 @app.on_message(filters.command(["1080g", "720g", "480g"]))
 async def compress_cmd(c, m: Message):
     if not await check_command_privacy(c, m):
@@ -235,13 +258,33 @@ async def compress_cmd(c, m: Message):
 async def hsub_cmd(c, m: Message):
     if not await check_command_privacy(c, m):
         return
-    media = _replied_media(m)
-    if not media:
-        return await m.reply("❌ Hardsub ke liye video par reply karein.")
+    src = _video_source(m)
+    if not src:
+        return await m.reply("❌ Hardsub ke liye video ya link par reply karein.")
+    video_id, orig_name = src
 
-    await m.reply("Send subtitle file (.srt, .ass, .vtt) ya skip karne ke liye `S` type karein.")
-    users_data[m.from_user.id] = {"video_msg_id": m.reply_to_message.id, "chat_id": m.chat.id,
-                                  "state": "WAIT_SUB", "rename": "none", "orig_name": file_name_of(media)}
+    if orig_name == "none":
+        await m.reply("🔗 Link mil gaya.\nSend subtitle file (.srt, .ass, .vtt) ya skip karne ke liye `S` type karein.\n"
+                      "(Sirf yehi subtitle burn hogi, video me pehle se jo ASS hai wo ignore hogi)")
+    else:
+        await m.reply("Send subtitle file (.srt, .ass, .vtt) ya skip karne ke liye `S` type karein.")
+    users_data[m.from_user.id] = {"video_id": video_id, "chat_id": m.chat.id,
+                                  "state": "WAIT_SUB", "rename": "none", "orig_name": orig_name}
+
+
+@app.on_message(filters.command("softsub"))
+async def softsub_cmd(c, m: Message):
+    if not await check_command_privacy(c, m):
+        return
+    src = _video_source(m)
+    if not src:
+        return await m.reply("❌ Softsub ke liye video ya link par reply karein.")
+    video_id, orig_name = src
+
+    await m.reply("Send subtitle file (.ass best hai, .srt / .vtt bhi chalegi).")
+    users_data[m.from_user.id] = {"video_id": video_id, "chat_id": m.chat.id,
+                                  "state": "WAIT_SUB", "rename": "none", "orig_name": orig_name,
+                                  "task_type": "softsub"}
 
 
 @app.on_message(filters.text | filters.document)
@@ -261,12 +304,13 @@ async def replies_controller(c, m: Message):
             session["sub_msg_link"] = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.id}"
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("Rename ke liye `R` / Same name ke liye `S` type karein.")
-        elif text == "S":
+        elif text == "S" and session.get("task_type") != "softsub":
             session["sub_msg_link"] = "none"
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("Rename ke liye `R` / Same name ke liye `S` type karein.")
         else:
-            await m.reply("❌ Invalid format! Please send a valid subtitle file ya type `S`.")
+            await m.reply("❌ Invalid format! Please send a valid subtitle file." if session.get("task_type") == "softsub"
+                          else "❌ Invalid format! Please send a valid subtitle file ya type `S`.")
 
     elif state == "WAIT_RENAME_CHOICE":
         if text == "R":
@@ -282,12 +326,12 @@ async def replies_controller(c, m: Message):
         if not m.text or not m.text.strip():
             return await m.reply("❌ Invalid name.")
         raw_name = m.text.strip()
-        if raw_name.lower().endswith(".mp4"):
+        if raw_name.lower().endswith((".mp4", ".mkv")):
             raw_name = raw_name[:-4]
         clean_name = re.sub(r'[\\/:*?"<>|]', '', raw_name).strip()
         if not clean_name:
             return await m.reply("❌ Invalid name.")
-        session["rename"] = clean_name + ".mp4"
+        session["rename"] = clean_name + (".mkv" if session.get("task_type") == "softsub" else ".mp4")
         await execute_dispatch_hardsub(user_id, m)
 
 
@@ -299,7 +343,7 @@ async def execute_dispatch_hardsub(user_id, msg: Message):
     st = await msg.reply("⏳ **Task Queued!**\nServer busy hain, aapka task queue me lag gaya hai aur turn aane par automatic start hoga."
                          if busy else "⏳ **Task Dispatched to Cloud Processing Node...**")
     await enqueue_task({
-        "task_type": "hardsub", "video_id": f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}",
+        "task_type": data.get("task_type", "hardsub"), "video_id": data["video_id"],
         "sub_id": data.get("sub_msg_link", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
         "resolution": "none", "rename": data.get("rename", "none"),
         "font_link": await get_pinned_file_link(data["chat_id"], "file"), "trigger_msg_id": str(st.id),
