@@ -35,14 +35,6 @@ HARDSUB_MAXRATE = "3000k"         # video bitrate ki upper limit (24 min episode
 HARDSUB_BUFSIZE = "6000k"         # maxrate ka double
 # size (MB) ~= bitrate(kbps) x seconds / 8000  -> lamba episode ho to MAXRATE kam karo
 
-# ---------------------------------------------------------
-# TELEGRAM DOWNLOAD SPEED
-# Video file ko DL_PARTS hisso me todke ek saath download karta hai (single stream se kaafi fast).
-# Fail ho to apne aap normal download par aa jaata hai.
-# ---------------------------------------------------------
-DL_PARTS = 8
-CHUNK = 1024 * 1024
-
 _user_id_raw = os.getenv("USER_ID")
 USER_ID = int(_user_id_raw) if _user_id_raw and _user_id_raw.strip().lower() != "none" else CHAT_ID
 
@@ -59,22 +51,6 @@ status_msg_id = None
 
 def is_set(v):
     return bool(v) and str(v).strip().lower() not in ("none", "")
-
-
-def fmt_dur(sec):
-    sec = int(max(0, sec))
-    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
-
-
-def sys_info():
-    cpu = os.cpu_count() or 1
-    ram = "?"
-    try:
-        kb = int(re.search(r"MemTotal:\s+(\d+)", open("/proc/meminfo").read()).group(1))
-        ram = f"{kb / 1048576:.1f} GB"
-    except Exception:
-        pass
-    return cpu, ram
 
 
 # =========================================================
@@ -524,44 +500,6 @@ def get_video_dimensions_and_duration(video_path):
     return width, height, duration
 
 
-async def fast_download(app_instance, media, path, step_name):
-    """Large file ko DL_PARTS hisso me parallel download karta hai.
-    Chhoti file (<5MB) ya koi dikkat ho to None / Exception -> caller normal download karta hai."""
-    size = getattr(media, "file_size", 0) or 0
-    if size < 5 * CHUNK:
-        return None
-    total_chunks = (size + CHUNK - 1) // CHUNK
-    parts = max(1, min(DL_PARTS, total_chunks))
-    per = (total_chunks + parts - 1) // parts
-    folder = os.path.dirname(path)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-    os.ftruncate(fd, size)
-    done = [0]
-
-    async def worker(start, count):
-        pos = start * CHUNK
-        async for chunk in app_instance.stream_media(media.file_id, limit=count, offset=start):
-            os.pwrite(fd, chunk, pos)
-            pos += len(chunk)
-            done[0] += len(chunk)
-            await prog(done[0], size, app_instance, step_name)
-
-    tasks = [asyncio.create_task(worker(i * per, min(per, total_chunks - i * per)))
-             for i in range(parts) if i * per < total_chunks]
-    try:
-        await asyncio.gather(*tasks)
-    except BaseException:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    finally:
-        os.close(fd)
-    return path
-
-
 async def download_tg_link(app_instance, link, output_path, step_name, min_size=1, show_progress=True):
     if not is_set(link):
         return None
@@ -572,31 +510,9 @@ async def download_tg_link(app_instance, link, output_path, step_name, min_size=
             if msg and (msg.document or msg.video or msg.photo or msg.animation):
                 if show_progress:
                     reset_prog()
-                downloaded = None
-
-                # 1) tez tareeka: parallel parts (sirf badi video par, pehli koshish me)
-                media = msg.video or msg.document or msg.animation
-                if show_progress and attempt == 1 and media is not None:
-                    try:
-                        downloaded = await asyncio.wait_for(
-                            fast_download(app_instance, media, output_path, step_name),
-                            timeout=TRANSFER_TIMEOUT)
-                        if downloaded and (not os.path.exists(downloaded) or
-                                           os.path.getsize(downloaded) < (media.file_size or 0) * 0.99):
-                            print("Fast download incomplete -> normal download")
-                            downloaded = None
-                    except Exception as e:
-                        print(f"Fast download failed ({e!r}) -> normal download")
-                        downloaded = None
-
-                # 2) normal tareeka (fallback)
-                if not downloaded:
-                    if show_progress:
-                        reset_prog()
-                    kw = dict(progress=prog, progress_args=(app_instance, step_name)) if show_progress else {}
-                    downloaded = await asyncio.wait_for(
-                        app_instance.download_media(msg, file_name=output_path, **kw), timeout=TRANSFER_TIMEOUT)
-
+                kw = dict(progress=prog, progress_args=(app_instance, step_name)) if show_progress else {}
+                downloaded = await asyncio.wait_for(
+                    app_instance.download_media(msg, file_name=output_path, **kw), timeout=TRANSFER_TIMEOUT)
                 if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) >= min_size:
                     return downloaded
             else:
@@ -605,6 +521,74 @@ async def download_tg_link(app_instance, link, output_path, step_name, min_size=
         except Exception as e:
             print(f"Download Exception (try {attempt}): {e}")
     return None
+
+
+# =========================================================
+# LINK DOWNLOAD (direct link / .torrent / magnet) -> aria2c
+# VIDEO_ID agar t.me ka link nahi hai to video yahan se download hoti hai.
+# Video ke andar jo subtitle pehle se hai wo yahan touch nahi hoti; hardsub me ffmpeg '-sn' lagata hai
+# aur sirf user ki di hui subtitle (ready_sub.ass) burn hoti hai.
+# =========================================================
+LINK_DL_DIR = "dl"
+VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".avi", ".mov", ".m4v", ".ts")
+ARIA_PROG = re.compile(r"([\d.]+\s?[KMGT]?i?B)/([\d.]+\s?[KMGT]?i?B)\((\d+)%\)")
+ARIA_SPEED = re.compile(r"DL:([\d.]+\s?[KMGT]?i?B)")
+
+
+def is_external_link(v):
+    """True = t.me ka message link nahi hai (direct / torrent / magnet link hai)."""
+    return is_set(v) and not re.match(r"https?://t\.me/", str(v).strip(), re.I)
+
+
+async def _aria_run(link, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = ["aria2c", "--dir", out_dir, "--console-log-level=warn", "--summary-interval=5",
+           "--enable-color=false", "--file-allocation=none", "--allow-overwrite=true",
+           "--auto-file-renaming=false", "--follow-torrent=true",
+           "--seed-time=0",            # torrent complete hote hi band (warna seed karta rehta)
+           "--bt-stop-timeout=300",    # 5 min tak speed 0 rahi to ruk jao
+           "--max-connection-per-server=16", "--split=16", "--min-split-size=1M",
+           link]
+    p = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    buf, tail, last = "", "", 0.0
+    try:
+        while True:
+            chunk = await p.stdout.read(2048)
+            if not chunk:
+                break
+            txt = chunk.decode("utf-8", "ignore")
+            buf = (buf + txt)[-800:]
+            tail = (tail + txt)[-1500:]
+            now = time.time()
+            if now - last > 8:
+                found = list(ARIA_PROG.finditer(buf))
+                if found:
+                    done, total, pct = found[-1].groups()
+                    speeds = ARIA_SPEED.findall(buf)
+                    speed = speeds[-1] if speeds else "?"
+                    print(f"[link_download] {pct}%  {speed}/s", flush=True)
+                    asyncio.create_task(update_http_status(
+                        f"📥 <b>Downloading Link</b>\n<code>{get_download_bar(int(pct))}</code> [{pct}%]\n"
+                        f"🚀 Speed: <b>{speed}/s</b>\n📦 {done} / {total}"))
+                    last = now
+        await p.wait()
+    finally:
+        if p.returncode is None:
+            p.kill()
+    if p.returncode != 0:
+        raise Exception("Link se download fail ho gaya:\n" + tail.strip()[-400:])
+
+    vids = [os.path.join(r, f) for r, _, fs in os.walk(out_dir) for f in fs if f.lower().endswith(VIDEO_EXTS)]
+    if not vids:
+        raise Exception("Link me koi video file nahi mili.")
+    return max(vids, key=os.path.getsize)   # season pack ho to sabse badi video
+
+
+async def download_external_link(link, out_dir=LINK_DL_DIR):
+    try:
+        return await asyncio.wait_for(_aria_run(link.strip(), out_dir), timeout=TRANSFER_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise Exception("Link download 40 min me complete nahi hua.")
 
 
 def make_thumb(file_path, duration):
@@ -756,6 +740,54 @@ async def run_ffmpeg(cmd, duration, title):
 
 
 # =========================================================
+# SOFTSUB: re-encode NAHI hota. Video + audio copy, ass + font mkv me add hote hain.
+# Ass jaisi hai waisi rehti hai; sirf ASI_Watermark style + watermark lines (upar ki layer) add hoti hain.
+# =========================================================
+FONT_MIME = {".ttf": "application/x-truetype-font", ".ttc": "application/x-truetype-font",
+             ".otf": "application/vnd.ms-opentype"}
+
+
+def prepare_softsub_ass(sub_file, duration, out_path="soft_sub.ass"):
+    text = read_text_any(sub_file).replace("\r\n", "\n").replace("\r", "\n")
+    if not (sub_file.lower().endswith((".ass", ".ssa")) or is_ass_text(text)):
+        # srt / vtt -> ass (ffmpeg se convert)
+        ext = ".vtt" if text.lstrip().upper().startswith("WEBVTT") else ".srt"
+        src, dst = "soft_in" + ext, "soft_conv.ass"
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(text)
+        r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src, dst],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(dst):
+            raise Exception("Subtitle ko ass me convert nahi kar paya:\n" + (r.stderr or "")[-300:])
+        text = read_text_any(dst).replace("\r\n", "\n").replace("\r", "\n")
+    if WATERMARK_STYLE_NAME not in text:
+        text = inject_watermark(text, duration)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return out_path
+
+
+async def run_softsub(video_file, sub_file, duration, out_name, title):
+    font_path = find_repo_font()
+    if not font_path:
+        raise Exception(f"Font nahi mila: repo ke '{FONT_DIR}' folder me font file daalo.")
+    ass_path = await asyncio.to_thread(prepare_softsub_ass, sub_file, duration)
+    mime = FONT_MIME.get(os.path.splitext(font_path)[1].lower(), "application/x-truetype-font")
+    print(f"Softsub font: {font_path} -> family '{get_font_name(font_path)}'", flush=True)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
+        "-i", video_file, "-i", ass_path,
+        "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+        "-c", "copy", "-c:s", "ass",
+        "-disposition:s:0", "default",
+        "-attach", font_path, "-metadata:s:t:0", f"mimetype={mime}",
+        "-max_muxing_queue_size", "1024",
+        out_name,
+    ]
+    await run_ffmpeg(cmd, duration, title)
+
+
+# =========================================================
 # MAIN
 # =========================================================
 async def main():
@@ -796,15 +828,19 @@ async def main():
 
     try:
         is_hardsub = TASK_TYPE == "hardsub"
-        step_dl = "hardsub_download" if is_hardsub else "compress_download"
-        t_begin = time.time()
+        is_softsub = TASK_TYPE == "softsub"
+        step_dl = "hardsub_download" if (is_hardsub or is_softsub) else "compress_download"
+        from_link = is_external_link(VIDEO_ID)   # True = direct / torrent / magnet link (Telegram se nahi)
 
         # ---- downloads: video starts right away, subtitle (tiny) fetched alongside ----
         # Font Telegram se nahi aata: hardsub ke time repo ke FONT_DIR folder se liya jaata hai.
-        video_task = asyncio.create_task(download_tg_link(app, VIDEO_ID, "video.mkv", step_dl, min_size=10000))
+        if from_link:
+            video_task = asyncio.create_task(download_external_link(VIDEO_ID))
+        else:
+            video_task = asyncio.create_task(download_tg_link(app, VIDEO_ID, "video.mkv", step_dl, min_size=10000))
         sub_file = None
         try:
-            if is_hardsub:
+            if is_hardsub or is_softsub:
                 sub_file = await download_tg_link(app, SUB_ID, "sub_raw", "sub", show_progress=False)
                 if not sub_file:
                     raise Exception("Subtitle file not found or download failed.")
@@ -814,8 +850,6 @@ async def main():
         video_file = await video_task
         if not video_file:
             raise Exception("Video download failed or file is 0 bytes.")
-        t_dl = time.time()
-        in_size_mb = os.path.getsize(video_file) / 1048576
 
         vid_width, vid_height, duration = get_video_dimensions_and_duration(video_file)
         if duration <= 0:
@@ -824,8 +858,23 @@ async def main():
         base_name = "output"
         if is_set(RENAME):
             base_name = RENAME.rsplit(".", 1)[0] if "." in RENAME else RENAME
+        elif from_link:
+            # "Same name" + link: naam download hui video ki file se
+            base_name = os.path.splitext(os.path.basename(video_file))[0]
         base_name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", base_name).strip()[:120] or "output"
-        out_name = f"{base_name}.mp4"
+        out_name = f"{base_name}.mkv" if is_softsub else f"{base_name}.mp4"
+
+        # ---- SOFTSUB: video + audio copy (re-encode nahi), ass + font mkv me add ----
+        if is_softsub:
+            title = "Muxing Softsub"
+            await update_http_status(f"⚙️ <b>{title}</b>\n<code>{get_process_bar(0)}</code> [0.0%]")
+            await run_softsub(video_file, sub_file, duration, out_name, title)
+            await update_http_status(f"📤 <b>Sending Video</b>\n<code>{get_send_bar(0)}</code> [0.0%]")
+            await deliver_video_asset(app, CHAT_ID, USER_ID, out_name,
+                                      f"✅ <b>Softsub Completed!</b>\n<code>{html.escape(out_name)}</code>", prog)
+            try: await app.delete_messages(CHAT_ID, status_msg_id)
+            except Exception: pass
+            return
 
         font_path = find_repo_font() if is_hardsub else None
         custom_font = bool(font_path)
@@ -863,35 +912,12 @@ async def main():
             extract_task = asyncio.create_task(extract_embedded_subs(video_file, base_name))
 
         await update_http_status(f"⚙️ <b>{title}</b>\n<code>{get_process_bar(0)}</code> [0.0%]")
-        t_enc0 = time.time()
         await run_ffmpeg(build_ffmpeg_cmd(video_file, vf, out_name, max_rate, buf_size, enc_preset, enc_crf, target_rate), duration, title)
-        t_enc1 = time.time()
 
         # ---- upload (as document) ----
         await update_http_status(f"📤 <b>Sending Video</b>\n<code>{get_send_bar(0)}</code> [0.0%]")
-        sent = await deliver_video_asset(app, CHAT_ID, USER_ID, out_name,
-                                         f"✅ <b>Process Completed!</b>\n<code>{html.escape(out_name)}</code>", prog)
-        t_up = time.time()
-
-        # ---- time report: kaunsa step kitna time le raha hai ----
-        try:
-            cpu, ram = sys_info()
-            out_size_mb = os.path.getsize(out_name) / 1048576
-            spd = duration / (t_enc1 - t_enc0) if t_enc1 > t_enc0 else 0
-            label = "Hardsub" if is_hardsub else "Compress"
-            report = (
-                f"⏱ <b>Time Report</b>\n"
-                f"📥 Download: <b>{fmt_dur(t_dl - t_begin)}</b>\n"
-                f"🔥 {label}: <b>{fmt_dur(t_enc1 - t_enc0)}</b> ({spd:.1f}x)\n"
-                f"📤 Upload: <b>{fmt_dur(t_up - t_enc1)}</b>\n"
-                f"🕒 Total: <b>{fmt_dur(t_up - t_begin)}</b>\n"
-                f"📦 Size: {in_size_mb:.0f} MB → <b>{out_size_mb:.0f} MB</b>\n"
-                f"🧠 CPU: {cpu} | RAM: {ram}")
-            print(re.sub(r"<[^>]+>", "", report), flush=True)
-            dest = getattr(getattr(sent, "chat", None), "id", None) or USER_ID
-            await app.send_message(dest, report, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            print(f"Time report failed: {e}")
+        await deliver_video_asset(app, CHAT_ID, USER_ID, out_name,
+                                  f"✅ <b>Process Completed!</b>\n<code>{html.escape(out_name)}</code>", prog)
 
         if extract_task:
             for sub_f in await extract_task:
